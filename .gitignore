@@ -1,0 +1,15 @@
+# Reports from running Ask Dad in this folder
+test-reports/
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+
+# Build output
+build/
+dist/
+utils/_build_stamp.py
+
+# macOS
+.DS_Store

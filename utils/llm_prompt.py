@@ -1,0 +1,507 @@
+"""LLM prompt generator for AI consultation about scan results."""
+
+import os
+
+from utils.memory import memory_summary, AVAILABLE_NOTE, APPS_NOTE
+from utils.path_utils import left_out_note
+from utils.system_info import format_system_info
+
+
+def generate_llm_prompt(scan_data, personality_data, system_info, include_file_names=True):
+    """
+    Generate a comprehensive prompt for LLM consultation.
+
+    Args:
+        scan_data: Scan results (storage or CPU)
+        personality_data: Dad's comments and tips
+        system_info: System specifications
+        include_file_names: Storage prompts only. False leaves out the
+            largest-files list so the prompt carries no individual file names.
+
+    Returns:
+        Formatted prompt string ready for LLM
+    """
+    scan_type = scan_data.get('scan_type', 'unknown')
+
+    if scan_type == 'storage':
+        return generate_storage_prompt(scan_data, personality_data, system_info,
+                                       include_file_names=include_file_names)
+    elif scan_type == 'cpu':
+        return generate_cpu_prompt(scan_data, personality_data, system_info)
+    else:
+        return generate_generic_prompt(scan_data, personality_data, system_info)
+
+
+def describe_coverage(scan_data):
+    """One sentence on what the scan skipped, or '' when it skipped nothing."""
+    excluded = scan_data.get('excluded_count') or 0
+    denied = scan_data.get('denied_count') or 0
+    parts = []
+    if excluded:
+        parts.append(f"{excluded:,} items were left out on purpose (hidden dotfiles, "
+                     "caches, Mail and Messages; the last three are measured separately)")
+    if denied:
+        parts.append(f"{denied:,} items macOS would not let the scan read")
+    if not parts:
+        return ""
+    return "Folder totals do not include everything on the disk: " + "; ".join(parts) + "."
+
+
+def _tilde(path, home):
+    """Show the home folder as ~ so the prompt never carries the account name."""
+    if home and (path == home or path.startswith(home.rstrip('/') + '/')):
+        return '~' + path[len(home.rstrip('/')):]
+    return path
+
+
+def describe_unseen(scan_data):
+    """Plain-language list of what the storage scan could not see."""
+    if scan_data.get('scan_scope') == 'other_volume':
+        return []
+    items = []
+    excluded = scan_data.get('excluded_count') or 0
+    denied = scan_data.get('denied_count') or 0
+    if excluded:
+        items.append(f"{excluded:,} items were left out on purpose: hidden dotfiles, caches, "
+                     "Mail and Messages. Caches, Mail and Messages are measured separately below.")
+    if denied:
+        items.append(f"{denied:,} items macOS would not let the scan read.")
+    if (scan_data.get('trash') or {}).get('permission_denied'):
+        items.append("The Trash could not be measured (macOS Full Disk Access), so it is "
+                     "missing from the folder list rather than counted as zero.")
+    snapshots = scan_data.get('snapshots') or {}
+    if snapshots.get('status') == 'complete' and snapshots.get('count'):
+        items.append("Time Machine snapshot sizes can't be measured, so no size is given for them.")
+    return items
+
+
+PROMPT_INTRO = """Make a cleanup plan to free up storage on my Mac, using the report below.
+Do not run, change or delete anything without my clear approval.
+
+STEP 1: Ask me what to keep (for example projects, music, documents, large
+video or media libraries) and wait for my answers. If you can't identify
+something, keep it and ask me.
+
+STEP 2: Write the plan. Sort every item into Move to Trash, Keep, or Back up
+first. For each item give: what it is, what happens if it's gone (one short
+sentence), how I can check before acting, the action, and the space it frees.
+- Never permanently delete. The only removal is "Move to Trash", so everything
+  is recoverable.
+- For Back up first items, suggest a local archive folder to move them into,
+  then copying it to cloud or an external disk.
+- Caches and snapshots can't go to the Trash. Name the safe way to clear them
+  and say why.
+- The Trash doesn't free space until it's emptied. Show the total I'd recover
+  once it's emptied, and make the last step "check, then empty the Trash" so
+  that stays my decision.
+"""
+
+
+def generate_storage_prompt(scan_data, personality_data, system_info, include_file_names=True):
+    """Generate prompt for storage scan results.
+
+    `include_file_names=False` leaves out the largest-files list, the one
+    section made of individual file names, for people who would rather not
+    share them. Paths always show the home folder as ~.
+    """
+
+    volume_info = scan_data.get('volume_info', {})
+    top_folders = scan_data.get('top_folders', [])[:10]
+    top_files = scan_data.get('top_files', [])[:10]
+    mac_libraries = scan_data.get('mac_libraries', {})
+    home = scan_data.get('home_path') or os.path.expanduser('~')
+
+    total = volume_info.get('total_human', '0 B')
+    used = volume_info.get('used_human', '0 B')
+    free = volume_info.get('free_human', '0 B')
+    used_percent = volume_info.get('used_percent', 0)
+
+    # Format top folders
+    folders_text = ""
+    for idx, folder in enumerate(top_folders, 1):
+        # Real paths, with the home folder as ~: the short display names put
+        # ~/Library and /Library side by side as "Library" and
+        # "Library/Application Support", and a model cannot tell them apart.
+        path = _tilde(folder.get('path') or folder.get('path_display', ''), home)
+        size = folder.get('size_human', '0 B')
+        folders_text += f"{idx}. {path}: {size}\n"
+        note = left_out_note(folder)
+        if note:
+            folders_text += f"   ({note})\n"
+
+    # Format top files, with the folder each one lives in: a bare name like
+    # "VB-ROYAL.blob" tells a model nothing.
+    files_text = ""
+    for idx, file_info in enumerate(top_files, 1):
+        path = _tilde(file_info.get('path', ''), home)
+        size = file_info.get('size_human', '0 B')
+        files_text += f"{idx}. {path}: {size}\n"
+
+    # Format Mac libraries
+    libraries_text = ""
+    for lib_type, lib_name in [('photos', 'Photos'), ('music', 'Music'),
+                                ('messages', 'Messages'), ('mail', 'Mail')]:
+        lib_data = mac_libraries.get(lib_type, {})
+        if lib_type in ['photos', 'music']:
+            size = lib_data.get('total_size_human', '0 B')
+        else:
+            size = lib_data.get('size_human', '0 B')
+        if size != '0 B':
+            libraries_text += f"- {lib_name}: {size}\n"
+
+    # What the scan covered. Without this an LLM reads a thumb drive's
+    # numbers as the whole Mac, and recommends clearing caches and libraries
+    # that were never measured because they are on another disk.
+    scope_line = ""
+    if scan_data.get('scan_scope') == 'other_volume':
+        scope_line = ("\n(This is one drive, not the startup disk. The home folder, "
+                      "Mac app libraries,\ncaches and snapshots are on another volume "
+                      "and were not scanned.)")
+
+    comments = personality_data.get('comments', [])
+    dad_text = '\n'.join(f'"{comment}"' for comment in comments)
+
+    prompt = f"""{PROMPT_INTRO}
+═══════════════════════════════════════
+SYSTEM SPECIFICATIONS
+═══════════════════════════════════════
+{format_system_info(system_info)}
+
+Please tell me whether this Mac's internal storage can be upgraded, and what
+that means for my options.
+
+═══════════════════════════════════════
+STORAGE STATUS
+═══════════════════════════════════════
+Volume: {scan_data.get('volume', 'Unknown')}{scope_line}
+Total Capacity: {total}
+Used: {used} ({used_percent:.0f}%)
+Available: {free}
+"""
+
+    unseen = describe_unseen(scan_data)
+    if unseen:
+        bullets = '\n'.join(f"- {item}" for item in unseen)
+        prompt += f"""
+═══════════════════════════════════════
+WHAT THIS SCAN COULD NOT SEE
+═══════════════════════════════════════
+Folder totals below do not include everything on the disk, so don't treat them
+as complete.
+{bullets}
+"""
+
+    prompt += f"""
+═══════════════════════════════════════
+LARGEST FOLDERS
+═══════════════════════════════════════
+{folders_text.strip()}
+"""
+
+    if include_file_names:
+        prompt += f"""
+═══════════════════════════════════════
+LARGEST FILES
+═══════════════════════════════════════
+{files_text.strip()}
+"""
+
+    if libraries_text:
+        prompt += f"""
+═══════════════════════════════════════
+MAC APP LIBRARIES
+═══════════════════════════════════════
+{libraries_text.strip()}
+"""
+
+    # Hidden caches: absent from scan data that does not measure them (a
+    # volume that isn't home's, or an older saved manifest), so the block is
+    # conditional and such prompts simply leave it out.
+    hidden = scan_data.get('hidden_caches') or {}
+    cache_entries = hidden.get('entries') or []
+    if cache_entries:
+        caches_text = '\n'.join(
+            f"- {entry.get('app_name', 'Unknown')}: {entry.get('size_human', '0 B')} "
+            f"({_tilde(entry.get('path', ''), home)})"
+            for entry in cache_entries[:15]
+        )
+        prompt += f"""
+═══════════════════════════════════════
+HIDDEN APP CACHES
+═══════════════════════════════════════
+These live under ~/Library/Caches and ~/Library/Logs, which Finder hides and
+the main scan above excludes. Total: {hidden.get('total_size_human', '0 B')} across {hidden.get('folder_count', 0)} folders.
+
+{caches_text}
+"""
+
+    snapshot_data = scan_data.get('snapshots') or {}
+    if snapshot_data.get('status') == 'complete' and snapshot_data.get('count'):
+        oldest = snapshot_data.get('oldest_age_days')
+        prompt += f"""
+═══════════════════════════════════════
+LOCAL APFS SNAPSHOTS
+═══════════════════════════════════════
+{snapshot_data['count']} local Time Machine snapshot(s) on this drive"""
+        if oldest is not None:
+            prompt += f", oldest {oldest} days old"
+        prompt += f""".
+{snapshot_data.get('stale_count', 0)} older than macOS's usual ~24h retention.
+{snapshot_data.get('os_update_count', 0)} system update snapshot(s), which are not user-reclaimable.
+
+Note: macOS does not expose per-snapshot sizes or a purgeable-space total to
+command-line tools, so no size is given here. Snapshots share storage via
+copy-on-write, which is why free space can stay flat after deleting files.
+"""
+
+    if dad_text:
+        prompt += f"""
+═══════════════════════════════════════
+MY DAD'S COMMENTS
+═══════════════════════════════════════
+{dad_text}
+"""
+
+    prompt += "\nStart with Step 1 now.\n"
+
+    return prompt
+
+
+def generate_cpu_prompt(scan_data, personality_data, system_info):
+    """Generate prompt for CPU/memory scan results."""
+
+    total_mem_gb = scan_data.get('total_memory_gb', 0)
+    memory_hogs = scan_data.get('memory_hogs', [])
+    top_processes = scan_data.get('top_processes', [])
+    top_memory_processes = scan_data.get('top_memory_processes', [])
+    process_metrics = scan_data.get('process_metrics', {})
+    all_processes = scan_data.get('all_processes', [])
+
+    # Format memory overview - the same figures the HTML and terminal print
+    mem = memory_summary(scan_data)
+    pressure_level = mem['pressure']
+    pressure_emoji = '🔴' if pressure_level == 'high' else '🟡' if pressure_level == 'medium' else '🟢' if pressure_level == 'low' else '⚪'
+    if mem['pressure_source']:
+        pressure_note = "reported by macOS"
+    elif pressure_level == 'unknown':
+        pressure_note = "macOS gave no reading"
+    else:
+        pressure_note = "estimated by an older Ask Dad, not reported by macOS"
+    used_line = mem['used_text'] + (f" ({mem['used_percent_text']})" if mem['used_percent_text'] else "")
+    swap_line = f"Swap in use: {mem['swap_used_text']}\n" if mem['swap_used_bytes'] is not None else ""
+
+    # Format memory hogs (show more - top 30)
+    hogs_text = ""
+    for idx, hog in enumerate(memory_hogs[:30], 1):
+        name = hog.get('name', 'Unknown')
+        mem_mb = hog.get('total_mb', 0)
+        mem_gb = mem_mb / 1024.0
+        process_count = hog.get('process_count', 1)
+
+        if mem_gb >= 1:
+            mem_display = f"{mem_gb:.1f} GB"
+        else:
+            mem_display = f"{mem_mb:.0f} MB"
+
+        hogs_text += f"{idx}. {name}: {mem_display}"
+        if process_count > 1:
+            hogs_text += f" ({process_count} processes)"
+        hogs_text += "\n"
+
+    # Format top CPU processes
+    cpu_text = ""
+    for idx, proc in enumerate(top_processes[:15], 1):
+        name = proc.get('name', 'Unknown')
+        cpu = proc.get('cpu_percent', 0)
+        mem_mb = proc.get('memory_mb', 0)
+
+        if mem_mb >= 1024:
+            mem_display = f"{mem_mb/1024:.1f} GB"
+        else:
+            mem_display = f"{mem_mb:.0f} MB"
+
+        cpu_text += f"{idx}. {name}: {cpu:.1f}% CPU, {mem_display} RAM\n"
+    
+    # Format top individual memory processes (not grouped)
+    memory_procs_text = ""
+    for idx, proc in enumerate(top_memory_processes[:30], 1):
+        name = proc.get('name', 'Unknown')
+        mem_mb = proc.get('memory_mb', 0)
+        cpu = proc.get('cpu_percent', 0)
+        mem_percent = proc.get('memory_percent', 0)
+        
+        if mem_mb >= 1024:
+            mem_display = f"{mem_mb/1024:.1f} GB"
+        else:
+            mem_display = f"{mem_mb:.0f} MB"
+        
+        memory_procs_text += f"{idx}. {name}: {mem_display} ({mem_percent:.1f}% of RAM), {cpu:.1f}% CPU\n"
+    
+    # Format process metrics
+    metrics_text = ""
+    if process_metrics:
+        total_procs = process_metrics.get('total_processes', 0)
+        procs_100mb = process_metrics.get('processes_over_100mb', 0)
+        procs_500mb = process_metrics.get('processes_over_500mb', 0)
+        procs_1gb = process_metrics.get('processes_over_1gb', 0)
+        avg_mem = process_metrics.get('avg_memory_mb', 0)
+        small_mb = process_metrics.get('small_processes_mb', 0)
+        medium_mb = process_metrics.get('medium_processes_mb', 0)
+        large_mb = process_metrics.get('large_processes_mb', 0)
+        small_count = process_metrics.get('small_processes_count', 0)
+        
+        metrics_text = f"""Total Processes: {total_procs:,}
+Processes over 100 MB: {procs_100mb}
+Processes over 500 MB: {procs_500mb}
+Processes over 1 GB: {procs_1gb}
+Average Memory per Process: {avg_mem:.0f} MB
+
+Memory Distribution:
+- Small processes (<100 MB): {small_count:,} processes using {small_mb/1024:.1f} GB
+- Medium processes (100-500 MB): {procs_100mb - procs_500mb} processes using {medium_mb/1024:.1f} GB
+- Large processes (≥500 MB): {procs_500mb} processes using {large_mb/1024:.1f} GB
+"""
+
+    # Format dad's assessment
+    comments = personality_data.get('comments', [])
+    status = personality_data.get('status', 'ok')
+    status_emoji = '🔴' if status == 'critical' else '🟡' if status == 'warn' else '🟢'
+
+    dad_text = '\n'.join(f'"{comment}"' for comment in comments)
+
+    # Format tips
+    tips = personality_data.get('tips', [])
+    tips_text = '\n'.join(f"• {tip}" for tip in tips)
+
+    prompt = f"""I'm experiencing performance issues on my Mac and need help understanding what's going on. Here's a detailed snapshot of my system:
+
+═══════════════════════════════════════
+SYSTEM SPECIFICATIONS
+═══════════════════════════════════════
+{format_system_info(system_info)}
+
+═══════════════════════════════════════
+MEMORY STATUS
+═══════════════════════════════════════
+Total RAM: {mem['total_text']}
+Used (active + wired + compressed): {used_line}
+Free (not used at all): {mem['free_text']}
+Available ({AVAILABLE_NOTE}): {mem['available_text']}
+Memory used by apps (approx., {APPS_NOTE}): {mem['apps_text']}
+{swap_line}Memory Pressure: {pressure_emoji} {pressure_level.upper()} ({pressure_note})
+Status: {status_emoji} {status.upper()}
+
+═══════════════════════════════════════
+PROCESS STATISTICS
+═══════════════════════════════════════
+{metrics_text.strip()}
+
+═══════════════════════════════════════
+APPS USING MOST MEMORY (Grouped)
+═══════════════════════════════════════
+Memory used by each app; {APPS_NOTE}, so quitting one
+frees less than its total.
+{hogs_text.strip()}
+
+═══════════════════════════════════════
+TOP INDIVIDUAL PROCESSES BY MEMORY
+═══════════════════════════════════════
+{memory_procs_text.strip()}
+
+═══════════════════════════════════════
+TOP CPU USAGE
+═══════════════════════════════════════
+{cpu_text.strip()}
+
+═══════════════════════════════════════
+ADVISOR'S ASSESSMENT
+═══════════════════════════════════════
+{dad_text}
+"""
+
+    if tips_text:
+        prompt += f"""
+Quick Wins Suggested:
+{tips_text}
+"""
+
+    # Add detailed process list if available (for deep analysis)
+    if all_processes:
+        detailed_procs_text = "\n═══════════════════════════════════════\n"
+        detailed_procs_text += "ALL PROCESSES (Detailed List)\n"
+        detailed_procs_text += "═══════════════════════════════════════\n"
+        detailed_procs_text += "Complete list of all processes sorted by memory usage.\n"
+        detailed_procs_text += "Command lines are left out: they carry folder paths and account names.\n\n"
+        
+        for idx, proc in enumerate(all_processes[:100], 1):  # Top 100 processes
+            name = proc.get('name', 'Unknown')
+            mem_mb = proc.get('memory_mb', 0)
+            cpu = proc.get('cpu_percent', 0)
+            mem_percent = proc.get('memory_percent', 0)
+
+            if mem_mb >= 1024:
+                mem_display = f"{mem_mb/1024:.2f} GB"
+            else:
+                mem_display = f"{mem_mb:.0f} MB"
+            
+            detailed_procs_text += f"{idx}. {name}\n"
+            detailed_procs_text += f"   Memory: {mem_display} ({mem_percent:.2f}% of RAM), CPU: {cpu:.1f}%\n"
+            detailed_procs_text += "\n"
+        
+        if len(all_processes) > 100:
+            detailed_procs_text += f"\n... and {len(all_processes) - 100} more processes (see full export for complete list)\n"
+        
+        prompt += detailed_procs_text
+
+    prompt += f"""
+═══════════════════════════════════════
+MY QUESTIONS
+═══════════════════════════════════════
+Based on this performance scan:
+
+1. Is my memory pressure level concerning? Should I be worried?
+2. Which apps should I quit to improve performance immediately?
+3. Is {total_mem_gb:.0f} GB RAM enough for my usage, or should I upgrade?
+4. Are any of these processes abnormal or problematic?
+5. What's causing my Mac to feel slow/show memory warnings?
+6. Should I restart my Mac, or is there a better solution?
+7. Are there any long-term changes I should make to prevent this?
+8. Can you identify any specific processes that are using more memory than they should?
+9. Are there any processes I should investigate further or be concerned about?
+
+Please provide specific, actionable recommendations based on my Mac model and the processes running. 
+If you see any unusual processes or patterns, please point them out.
+"""
+
+    return prompt
+
+
+def generate_generic_prompt(scan_data, personality_data, system_info):
+    """Generate generic prompt when scan type is unknown."""
+
+    comments = personality_data.get('comments', [])
+    dad_text = '\n'.join(f'"{comment}"' for comment in comments)
+
+    prompt = f"""I ran a system scan on my Mac and need help understanding the results:
+
+═══════════════════════════════════════
+SYSTEM SPECIFICATIONS
+═══════════════════════════════════════
+{format_system_info(system_info)}
+
+═══════════════════════════════════════
+ADVISOR'S ASSESSMENT
+═══════════════════════════════════════
+{dad_text}
+
+═══════════════════════════════════════
+MY QUESTIONS
+═══════════════════════════════════════
+1. What do these results mean for my Mac's health?
+2. Should I take any action based on these findings?
+3. Are there any concerning issues I should address?
+
+Please provide specific recommendations for my Mac model.
+"""
+
+    return prompt
