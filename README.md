@@ -29,15 +29,16 @@ After the first scan, Dad asks if you want the `askdad` command in every Termina
 
 The app is signed and notarized by Apple, and it runs on Apple silicon and Intel Macs.
 
-**For Terminal users: run it from GitHub.** Ask Dad is plain Python with no dependencies, so you can run this repository directly:
+**Run from source (for developers).** The app above has everything built in. If you'd rather run the Python source directly, you need `python3` (macOS offers to install it the first time you type `python3`). Ask Dad has no other dependencies.
 
-```bash
+​```bash
 git clone https://github.com/jbillington/askdad.git
 cd askdad
 python3 askdad.py
-```
+​```
+Reports are saved in the `test-reports` folder inside `askdad`. 
 
-It needs `python3`, which comes with Apple's Command Line Tools. If your Mac doesn't have it yet, macOS offers to install it the first time you type `python3`. Run this way, use `python3 askdad.py` wherever this page says `askdad`, and reports are saved in the `test-reports` folder inside `askdad`. To update, run `git pull` in that folder.
+Homebrew formula coming soon. 
 
 ## Commands
 
@@ -83,8 +84,8 @@ Without it, the scan still works. The libraries it can't open, and the Trash, ar
 
 ## Safety
 
-This tool only scans and reports. It does not delete files, and it does not advise you what to delete. Any cleanup decisions are yours.
+This tool only scans and reports. It does not access the internet, and it does not delete files. For now, cleanup decisions are yours.
 
 ---
 
-MIT License — Copyright (c) 2025 John Billington. See [LICENSE](LICENSE).
+MIT License — Copyright (c) 2025-26 John Billington. See [LICENSE](LICENSE).
