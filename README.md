@@ -21,19 +21,11 @@ This project is licensed under the MIT License.
 
 ## Install
 
-There are two ways to install Ask Dad.
-
-**1. Download the app (most people).** Go to [justaskdad.app](https://justaskdad.app) and click Download. Open `AskDad.dmg`, drag Ask Dad into Applications, and double-click it. A Terminal window opens, the scan runs, and your report opens in your browser.
+Go to [justaskdad.app](https://justaskdad.app) and click Download. Open `AskDad.dmg`, drag Ask Dad into Applications, and double-click it. A Terminal window opens, the scan runs, and your report opens in your browser.
 
 After the first scan, Dad asks if you want the `askdad` command in every Terminal window. Say yes to use the commands below. Say no to keep using only the app.
 
-**2. Homebrew (if you use the Terminal).**
-```bash
-brew install jbillington/tap/askdad
-```
-To update: `brew upgrade askdad`. To remove: `brew uninstall askdad`.
-
-Both install the same program. It is signed and notarized by Apple, and it runs on Apple silicon and Intel Macs.
+The app is signed and notarized by Apple, and it runs on Apple silicon and Intel Macs.
 
 ## Commands
 
@@ -74,7 +66,7 @@ Without this, the scan still works — protected libraries just show 0 bytes.
 | Problem | Fix |
 |---------|-----|
 | macOS asks "Are you sure you want to open it?" | This is normal for any downloaded app. Click **Open**. |
-| `askdad: command not found` | Open a new Terminal window. If you said no to Dad's question, run the app again from Applications, or install with Homebrew. |
+| `askdad: command not found` | Open a new Terminal window. If you said no to Dad's question, run the app again from Applications. |
 | Dad didn't offer the `askdad` command | Drag the app into Applications first. Dad doesn't ask when the app runs from the DMG, or when `askdad` is already installed. |
 
 ## Safety
