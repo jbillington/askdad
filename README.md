@@ -4,11 +4,12 @@
 **Website, download and a sample report: [justaskdad.app](https://justaskdad.app)**
 
 ## About the program
-Ask Dad is a free tool for kids and adults who need to know why their Mac is running slow or why they are out of storage.  It is both a learning tool for the file system and a way to get a detailed report about your system performance and available storage. 
+Ask Dad is a free tool for kids and adults to identify what is taking up space.  It explains the various categories of files on a Mac and can be used as a learning tool for the file system.  For others it's a fast way to get a detailed report so you can manually reclaim space through the Trash or archiving. I've made the source open so that you can trust it's not going to scam you. 
 
-Use Ask Dad to scan your Mac's file system, measure available space and provide a HTML report card with letter grades and advice. The report card lets you visually see what folders are taking up space, highlights the largest files, and tells you what to clean up. The scan program is similar but provides an overview of memory pressure and CPU hogging processes for quick diagnoses.  
+Ask Dad produces a report card that highlights the largest folders and files and provides insight into hidden files, caches and snapshots. 
+There is also a memory and CPU scanner that provides an overview of memory pressure and CPU hogging processes for quick diagnoses.  
 
-Under the hood Ask Dad is a python program that scans your hard drive and measures file sizes.  It is lightweight and doesn't have dependencies other than python.  It was made by a Dad who is an engineer. The code was written by AI but it contains no calls to AI services. The program is Read-Only so it never deletes your files, we leave that to you. 
+Under the hood Ask Dad is a python program that scans your hard drive and measures file sizes.  It is lightweight and doesn't have dependencies other than python.  It was made by a Dad who is an engineer. The code was written by AI but it contains no calls to the Internet or AI services. 
 
 
 ## 📄 License and Trademarks
