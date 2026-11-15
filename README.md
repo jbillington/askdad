@@ -1,6 +1,8 @@
 # Ask Dad for Mac
 *by DadWare*
 
+**Website, download and a sample report: [justaskdad.app](https://justaskdad.app)**
+
 ## About the program
 Ask Dad is a free tool for kids and adults who need to know why their Mac is running slow or why they are out of storage.  It is both a learning tool for the file system and a way to get a detailed report about your system performance and available storage. 
 
@@ -21,11 +23,21 @@ This project is licensed under the MIT License.
 
 ## Install
 
-Go to [justaskdad.app](https://justaskdad.app) and click Download. Open `AskDad.dmg`, drag Ask Dad into Applications, and double-click it. A Terminal window opens, the scan runs, and your report opens in your browser.
+**The easiest way: download the app.** Go to [justaskdad.app](https://justaskdad.app) and click Download. Open `AskDad.dmg`, drag Ask Dad into Applications, and double-click it. A Terminal window opens, the scan runs, and your report opens in your browser. The website also has a sample report and answers to common questions.
 
 After the first scan, Dad asks if you want the `askdad` command in every Terminal window. Say yes to use the commands below. Say no to keep using only the app.
 
 The app is signed and notarized by Apple, and it runs on Apple silicon and Intel Macs.
+
+**For Terminal users: run it from GitHub.** Ask Dad is plain Python with no dependencies, so you can run this repository directly:
+
+```bash
+git clone https://github.com/jbillington/askdad.git
+cd askdad
+python3 askdad.py
+```
+
+It needs `python3`, which comes with Apple's Command Line Tools. If your Mac doesn't have it yet, macOS offers to install it the first time you type `python3`. Run this way, use `python3 askdad.py` wherever this page says `askdad`, and reports are saved in the `test-reports` folder inside `askdad`. To update, run `git pull` in that folder.
 
 ## Commands
 
@@ -59,14 +71,14 @@ askdad export memory report.json     # Export CSV from a previously saved report
 
 To scan Photos, Messages, and Mail: **System Settings** → **Privacy & Security** → **Full Disk Access** → add **Terminal.app**.
 
-Without this, the scan still works — protected libraries just show 0 bytes.
+Without it, the scan still works. The libraries it can't open, and the Trash, are marked "needs Full Disk Access" in the report and left out of the grade, rather than counted as empty.
 
 ## Troubleshooting
 
 | Problem | Fix |
 |---------|-----|
 | macOS asks "Are you sure you want to open it?" | This is normal for any downloaded app. Click **Open**. |
-| `askdad: command not found` | Open a new Terminal window. If you said no to Dad's question, run the app again from Applications. |
+| `askdad: command not found` | Open a new Terminal window. If you said no to Dad's question, run the app again from Applications. Running from a GitHub copy? Use `python3 askdad.py` in that folder. |
 | Dad didn't offer the `askdad` command | Drag the app into Applications first. Dad doesn't ask when the app runs from the DMG, or when `askdad` is already installed. |
 
 ## Safety
