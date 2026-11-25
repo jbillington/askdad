@@ -45,6 +45,13 @@ def feedback_line():
     return f"{FEEDBACK_INVITE}\n{FEEDBACK_EMAIL}"
 
 
+def share_line():
+    """How to send this scan to the team. The file itself is never attached
+    for the user: `askdad share` asks first (see utils/share.py)."""
+    where = "type in this Terminal window" if is_app_channel() else "run"
+    return f"To send me this scan, {where}:  askdad share"
+
+
 def promo_command(scan_type):
     """The command that runs the *other* scan, or None.
 

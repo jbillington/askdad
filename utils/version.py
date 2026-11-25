@@ -28,7 +28,7 @@ import subprocess
 import sys
 
 # Hand-set. Bump this deliberately when cutting a release.
-VERSION = "1.0-beta.2"
+VERSION = "1.0-beta.3"
 
 # Used when neither a build stamp nor a git checkout is available.
 _FALLBACK_BUILD = "unknown"

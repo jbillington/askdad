@@ -4,12 +4,11 @@
 **Website, download and a sample report: [justaskdad.app](https://justaskdad.app)**
 
 ## About the program
-Ask Dad is a free tool for kids and adults to identify what is taking up space.  It explains the various categories of files on a Mac and can be used as a learning tool for the file system.  For others it's a fast way to get a detailed report so you can manually reclaim space through the Trash or archiving. I've made the source open so that you can trust it's not going to scam you. 
+Ask Dad is a free tool for kids and adults who need to know why their Mac is running slow or why they are out of storage.  It is both a learning tool for the file system and a way to get a detailed report about your system performance and available storage. 
 
-Ask Dad produces a report card that highlights the largest folders and files and provides insight into hidden files, caches and snapshots. 
-There is also a memory and CPU scanner that provides an overview of memory pressure and CPU hogging processes for quick diagnoses.  
+Use Ask Dad to scan your Mac's file system, measure available space and provide a HTML report card with letter grades and advice. The report card lets you visually see what folders are taking up space, highlights the largest files, and tells you what to clean up. The scan program is similar but provides an overview of memory pressure and CPU hogging processes for quick diagnoses.  
 
-Under the hood Ask Dad is a python program that scans your hard drive and measures file sizes.  It is lightweight and doesn't have dependencies other than python.  It was made by a Dad who is an engineer. The code was written by AI but it contains no calls to the Internet or AI services. 
+Under the hood Ask Dad is a python program that scans your hard drive and measures file sizes.  It is lightweight and doesn't have dependencies other than python.  It was made by a Dad who is an engineer. The code was written by AI but it contains no calls to AI services. The program is Read-Only so it never deletes your files, we leave that to you. 
 
 
 ## 📄 License and Trademarks
@@ -30,16 +29,15 @@ After the first scan, Dad asks if you want the `askdad` command in every Termina
 
 The app is signed and notarized by Apple, and it runs on Apple silicon and Intel Macs.
 
-**Run from source (for developers).** The app above has everything built in. If you'd rather run the Python source directly, you need `python3` (macOS offers to install it the first time you type `python3`). Ask Dad has no other dependencies.
+**For Terminal users: run it from GitHub.** Ask Dad is plain Python with no dependencies, so you can run this repository directly:
 
-​```bash
+```bash
 git clone https://github.com/jbillington/askdad.git
 cd askdad
 python3 askdad.py
-​```
-Reports are saved in the `test-reports` folder inside `askdad`. 
+```
 
-Homebrew formula coming soon. 
+It needs `python3`, which comes with Apple's Command Line Tools. If your Mac doesn't have it yet, macOS offers to install it the first time you type `python3`. Run this way, use `python3 askdad.py` wherever this page says `askdad`, and reports are saved in the `test-reports` folder inside `askdad`. To update, run `git pull` in that folder.
 
 ## Commands
 
@@ -85,8 +83,8 @@ Without it, the scan still works. The libraries it can't open, and the Trash, ar
 
 ## Safety
 
-This tool only scans and reports. It does not access the internet, and it does not delete files. For now, cleanup decisions are yours.
+This tool only scans and reports. It does not delete files, and it does not advise you what to delete. Any cleanup decisions are yours.
 
 ---
 
-MIT License — Copyright (c) 2025-26 John Billington. See [LICENSE](LICENSE).
+MIT License — Copyright (c) 2025 John Billington. See [LICENSE](LICENSE).

@@ -3,10 +3,49 @@
 import os
 import subprocess
 import time
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from utils.formatters import format_size
 from utils.path_utils import should_skip_path, get_file_size_disk, get_folder_size_generic
+
+# Shown in place of a size when a library could not be measured. A refused
+# read is never reported as 0 B: readers of the manifest (the HTML report,
+# the AI prompt, the native app) would take a zero for an empty library.
+NOT_MEASURED = 'not measured'
+
+# `du` on a large Photos library on a slow disk takes well over 10 seconds.
+# Generous, like the per-folder limit in scanners/hidden_storage.py.
+PHOTOS_DU_TIMEOUT_SECONDS = 120
+
+
+def _read_refused(path: str) -> Optional[str]:
+    """Return the error text if macOS refuses to list `path`, else None.
+
+    Without Full Disk Access, listing ~/Library/Messages or ~/Library/Mail
+    raises PermissionError ("Operation not permitted"). The folder walk
+    swallows that and returns 0 bytes, so the refusal has to be checked
+    before the walk, or a blocked library reads as an empty one.
+    """
+    try:
+        os.listdir(path)
+    except PermissionError as e:
+        return e.strerror or 'Permission denied'
+    except OSError:
+        return None
+    return None
+
+
+def _denied_result(lib_type: str, path: str, error: str) -> Dict[str, Any]:
+    """The result for a library macOS would not let us read."""
+    return {
+        'type': lib_type,
+        'path': path,
+        'size_bytes': None,
+        'size_human': NOT_MEASURED,
+        'count': None,
+        'status': 'denied',
+        'error': error,
+    }
 
 
 def get_folder_size(folder_path: str, min_size_bytes: int = 0, max_depth: int = 10,
@@ -74,34 +113,42 @@ def find_photos_libraries() -> List[str]:
     return libraries
 
 
-def get_photos_library_size(lib_path: str) -> int:
+def get_photos_library_size(lib_path: str) -> Tuple[Optional[int], Optional[str], bool]:
     """
-    Get size of a Photos library using du -skx (treats as leaf, no recursion).
-    Returns size in bytes, or 0 if unavailable.
+    Size a Photos library with `du -skx` (the package as one leaf).
+
+    Returns (bytes or None, note, refused). `du` on a library it can only
+    partly read exits non-zero but still prints a total; that total is kept,
+    with a note, because it is a floor. When there is no total at all (a
+    refusal, a timeout) the size is None, never 0. `refused` is True when
+    macOS blocked the read (no Photos or Full Disk Access permission).
     """
-    # Defensive check: lib_path must be valid
     if not lib_path or not isinstance(lib_path, str):
-        return 0
-    
+        return None, 'Could not measure this library', False
+
+    cmd = ['/usr/bin/du', '-skx', lib_path]
     try:
-        # Use du -skx to get size without recursing into the package
-        cmd = ['/usr/bin/du', '-skx', lib_path]
         from utils.subprocess_utils import log_subprocess_call
         log_subprocess_call("get_photos_library_size()", cmd)
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        if result.returncode == 0:
-            # du returns size in KB, convert to bytes
-            size_kb = int(result.stdout.split()[0])
-            return size_kb * 1024
-    except (subprocess.TimeoutExpired, ValueError, IndexError, FileNotFoundError, OSError, PermissionError, TypeError):
-        pass
-    
-    return 0
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=PHOTOS_DU_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        return None, 'Timed out measuring this library', False
+    except (FileNotFoundError, OSError, ValueError, TypeError):
+        return None, 'Could not measure this library', False
+
+    stderr = (result.stderr or '').lower()
+    refused = 'not permitted' in stderr or 'permission denied' in stderr
+    try:
+        size_kb = int((result.stdout or '').split()[0])
+    except (ValueError, IndexError):
+        if refused:
+            return None, 'Permission restricted - size unavailable', True
+        return None, 'Could not measure this library', False
+
+    if result.returncode != 0:
+        return size_kb * 1024, 'Permission restricted - size may be incomplete', refused
+    return size_kb * 1024, None, False
 
 
 def scan_photos_library() -> Dict[str, Any]:
@@ -109,43 +156,57 @@ def scan_photos_library() -> Dict[str, Any]:
     Scan for Photos libraries (.photoslibrary).
     Uses non-recursive search in allowlist paths only.
     Treats each library as a leaf and uses du -skx for size.
+
+    The result's `status` is set here when something was not fully
+    measured: 'denied' when macOS refused every library, 'error' when none
+    could be measured for another reason (a timeout), and 'partial' when
+    the total leaves something out. scan_all_mac_libraries() fills in
+    'complete' otherwise.
     """
     libraries = []
     found_paths = find_photos_libraries()
-    
+
     for lib_path in found_paths:
-        try:
-            size_bytes = get_photos_library_size(lib_path)
-            libraries.append({
-                'path': lib_path,
-                'name': os.path.basename(lib_path),
-                'size_bytes': size_bytes,
-                'size_human': format_size(size_bytes),
-                'type': 'photos'
-            })
-        except (OSError, PermissionError):
-            # If we can't access it, still add it with 0 size so user knows it exists
-            libraries.append({
-                'path': lib_path,
-                'name': os.path.basename(lib_path),
-                'size_bytes': 0,
-                'size_human': format_size(0),
-                'type': 'photos',
-                'note': 'Permission restricted - size unavailable'
-            })
-    
-    # Sort by size
-    libraries.sort(key=lambda x: x['size_bytes'], reverse=True)
-    
-    total_size = sum(lib['size_bytes'] for lib in libraries)
-    
-    return {
+        size_bytes, note, refused = get_photos_library_size(lib_path)
+        entry = {
+            'path': lib_path,
+            'name': os.path.basename(lib_path),
+            'size_bytes': size_bytes,
+            'size_human': format_size(size_bytes) if size_bytes is not None else NOT_MEASURED,
+            'type': 'photos',
+        }
+        if note:
+            entry['note'] = note
+        if refused:
+            entry['refused'] = True
+        libraries.append(entry)
+
+    # Largest first; unmeasured libraries last.
+    libraries.sort(key=lambda x: x['size_bytes'] if x['size_bytes'] is not None else -1,
+                   reverse=True)
+
+    measured = [lib for lib in libraries if lib['size_bytes'] is not None]
+    total_size = sum(lib['size_bytes'] for lib in measured)
+    result = {
         'type': 'photos',
         'libraries': libraries,
         'total_size_bytes': total_size,
         'total_size_human': format_size(total_size),
         'count': len(libraries)
     }
+
+    if libraries and not measured:
+        result['total_size_bytes'] = None
+        result['total_size_human'] = NOT_MEASURED
+        if all(lib.get('refused') for lib in libraries):
+            result['status'] = 'denied'
+            result['error'] = 'Permission restricted - size unavailable'
+        else:
+            result['status'] = 'error'
+            result['error'] = next(lib['note'] for lib in libraries if lib.get('note'))
+    elif any(lib.get('note') for lib in libraries):
+        result['status'] = 'partial'
+    return result
 
 
 def scan_music_library() -> Dict[str, Any]:
@@ -206,6 +267,10 @@ def scan_messages() -> Dict[str, Any]:
             'count': 0
         }
     
+    refused = _read_refused(messages_path)
+    if refused:
+        return _denied_result('messages', messages_path, refused)
+
     try:
         # Try with deeper depth for Messages as it can have nested structure
         # Don't skip hidden files - Messages uses hidden files
@@ -240,14 +305,17 @@ def scan_messages() -> Dict[str, Any]:
             'size_human': format_size(size),
             'count': count
         }
-    except (OSError, PermissionError) as e:
-        # Return 0 but don't fail completely
+    except PermissionError as e:
+        return _denied_result('messages', messages_path, e.strerror or str(e))
+    except OSError as e:
         return {
             'type': 'messages',
             'path': messages_path,
-            'size_bytes': 0,
-            'size_human': format_size(0),
-            'count': 0
+            'size_bytes': None,
+            'size_human': NOT_MEASURED,
+            'count': None,
+            'status': 'error',
+            'error': str(e),
         }
 
 
@@ -265,6 +333,10 @@ def scan_mail() -> Dict[str, Any]:
             'count': 0
         }
     
+    refused = _read_refused(mail_path)
+    if refused:
+        return _denied_result('mail', mail_path, refused)
+
     try:
         # Don't skip hidden files for Mail
         size, count = get_folder_size(mail_path, min_size_bytes=0, max_depth=10, current_depth=0, skip_hidden=False)
@@ -275,13 +347,17 @@ def scan_mail() -> Dict[str, Any]:
             'size_human': format_size(size),
             'count': count
         }
-    except (OSError, PermissionError):
+    except PermissionError as e:
+        return _denied_result('mail', mail_path, e.strerror or str(e))
+    except OSError as e:
         return {
             'type': 'mail',
             'path': mail_path,
-            'size_bytes': 0,
-            'size_human': format_size(0),
-            'count': 0
+            'size_bytes': None,
+            'size_human': NOT_MEASURED,
+            'count': None,
+            'status': 'error',
+            'error': str(e),
         }
 
 
@@ -394,7 +470,10 @@ def scan_all_mac_libraries(timeout_seconds: float = 60) -> Dict[str, Any]:
             
             try:
                 result = scan_func()
-                result['status'] = 'complete'
+                # A scanner that could not measure its library says so
+                # ('denied', 'error', 'partial'); only fill in 'complete'
+                # when it did not.
+                result.setdefault('status', 'complete')
                 results[scan_name] = result
             except KeyboardInterrupt:
                 # User pressed Ctrl-C - re-raise to handle at top level
@@ -425,11 +504,12 @@ def scan_all_mac_libraries(timeout_seconds: float = 60) -> Dict[str, Any]:
                     'count': 0
                 }
     
-    # Calculate total from completed scans
+    # Total of what was measured: complete scans, plus the measured part of
+    # a partial one. Unmeasured libraries carry None and add nothing.
     total_size = sum(
-        result.get('total_size_bytes', result.get('size_bytes', 0))
+        (result.get('total_size_bytes', result.get('size_bytes')) or 0)
         for result in results.values()
-        if result.get('status') == 'complete'
+        if result.get('status') in ('complete', 'partial')
     )
     
     results['total_size_bytes'] = total_size

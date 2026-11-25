@@ -13,6 +13,7 @@ import webbrowser
 import traceback
 from utils.volumes import select_volume
 from utils.narration import say
+from utils import events
 from utils.formatters import format_size
 from utils.path_utils import is_on_scan_volume, is_under
 from utils.subprocess_utils import DIAGNOSTIC_LOGGING
@@ -31,10 +32,11 @@ from utils.permissions import (
     permissions_introduced,
 )
 from utils.timing import get_timer
-from utils.promo import CPU_PROMPT, cpu_promo_line, feedback_line
+from utils.promo import CPU_PROMPT, cpu_promo_line, feedback_line, share_line
+from utils.share import run_share
 from utils.version import VERSION, BUILD
 from scanners.storage import scan_storage, parse_size
-from scanners.grading import calculate_storage_metrics
+from scanners.grading import calculate_storage_metrics, grade_storage_report
 from scanners.cpu import scan_cpu
 from scanners.mac_libraries import scan_all_mac_libraries as scan_all_mac_libraries_func
 from scanners.hidden_storage import scan_hidden_storage
@@ -95,7 +97,9 @@ def report_scan_progress(items_found, elapsed_time):
         items_found: Number of items found so far
         elapsed_time: Time elapsed in seconds
     """
-    rate = items_found / elapsed_time if elapsed_time > 0 else 0
+    if events.enabled():
+        events.emit('progress', items=items_found, elapsed=round(elapsed_time, 1))
+        return
     print(f"→ found {items_found:,} items... ({elapsed_time:.0f}s elapsed)", end='\r', flush=True)
 
 
@@ -247,7 +251,9 @@ def offer_permission_upgrade(scan_data, args):
     Here the report is already written and opened, so "this takes effect
     next time" is simply true.
     """
-    if args.skip_protected:
+    if args.skip_protected or events.enabled():
+        # A program reading events cannot answer a question, and decides for
+        # itself what to offer from `permission_status` in the manifest.
         return
     status = (scan_data or {}).get('permission_status') or {}
     if status.get('has_access', True) or not status.get('missing_permissions'):
@@ -267,7 +273,7 @@ def promos_wanted(args):
     Only for a person at a terminal. A --terminal run, or one whose output
     goes to a file or a scheduled job's log, does not want an invitation in it.
     """
-    return not args.terminal and sys.stdout.isatty()
+    return not args.terminal and not events.enabled() and sys.stdout.isatty()
 
 
 def ask_to_run_cpu_scan():
@@ -320,6 +326,44 @@ def print_closing_lines(args, promo_scan_type=None):
     if promo:
         print(f"\n{promo}")
     print(f"\n{feedback_line()}")
+    print(share_line())
+
+
+def report_scan_failure(text):
+    """Tell a program the scan failed, unless a more exact error already did."""
+    if not events.error_sent():
+        events.emit('error', code='scan_failed', text=text)
+
+
+def print_terminal_report(scan_data, personality_data, args):
+    """Print the terminal report, unless a program is reading events: it
+    reads the manifest, and the report would only be noise on stderr."""
+    if events.enabled():
+        return
+    print(render_terminal(scan_data, personality_data, not args.no_color))
+
+
+def run_permissions_check(json_mode):
+    """`askdad permissions`: what this run can read, without a scan.
+
+    Reads the three folders macOS asks about and the three libraries behind
+    Full Disk Access. Looking at Desktop, Documents and Downloads makes macOS
+    show its dialog the first time, the same as a scan does.
+    """
+    result = {
+        'full_disk_access': check_full_disk_access(),
+        'folders': choreograph_permission_prompts(),
+    }
+    if json_mode:
+        events.emit('result', type='permissions', permissions=result)
+        return 0
+
+    fda = result['full_disk_access']
+    print("Full Disk Access: " + ("yes" if fda.get('has_access') else
+          "no (cannot read: " + ", ".join(fda.get('missing_permissions', [])) + ")"))
+    for name, info in result['folders'].items():
+        print(f"{name}: {info.get('status')}")
+    return 0
 
 
 def print_header():
@@ -328,6 +372,38 @@ def print_header():
     print(f" Ask Dad for Mac v{VERSION}")
     print(f" Build: {BUILD}")
     print("────────────────────────────────")
+
+
+def build_manifest(prefix, scan_data, personality_data, report_path,
+                   report_id, generated_at):
+    """The JSON manifest for one scan: the result a program reads.
+
+    Its keys are a contract with every reader (docs/CONTRACT.md). Add keys
+    freely; removing or redefining one means raising
+    `events.SCHEMA_VERSION`.
+    """
+    manifest = {
+        'schema_version': events.SCHEMA_VERSION,
+        'askdad_version': VERSION,
+        'report_id': report_id,
+        'generated_at': generated_at,
+        'scan_results': {prefix: scan_data},
+        'personality_comments': personality_data.get('comments', []),
+        'personality': {
+            'status': personality_data.get('status'),
+            'comments': personality_data.get('comments', []),
+            'tips': personality_data.get('tips', []),
+        },
+        'report_files': {
+            'html': report_path
+        }
+    }
+    # The report card's letters, for readers that do not draw the HTML. Only
+    # where the report shows a card: the startup disk, not another drive.
+    if (prefix == 'storage' and scan_data.get('volume_info')
+            and scan_data.get('scan_scope') != 'other_volume'):
+        manifest['grades'] = grade_storage_report(scan_data)
+    return manifest
 
 
 def save_and_open_report(scan_data, personality_data, prefix, args, label='Full report'):
@@ -365,21 +441,20 @@ def save_and_open_report(scan_data, personality_data, prefix, args, label='Full 
         render_html(scan_data, personality_data, report_path)
 
     # Save manifest
-    manifest = {
-        'report_id': f"{prefix}_{timestamp}",
-        'generated_at': datetime.datetime.now().isoformat(),
-        'scan_results': {prefix: scan_data},
-        'personality_comments': personality_data.get('comments', []),
-        'report_files': {
-            'html': report_path
-        }
-    }
+    manifest = build_manifest(prefix, scan_data, personality_data, report_path,
+                              report_id=f"{prefix}_{timestamp}",
+                              generated_at=datetime.datetime.now().isoformat())
     manifest_path = os.path.join(reports_dir, f"{prefix}_{timestamp}.json")
     with open(manifest_path, 'w') as f:
         json.dump(manifest, f, indent=2)
 
-    # Open in browser
     file_url = f"file://{report_path}"
+    if events.enabled():
+        # The caller decides what to show; opening a browser is not its choice.
+        events.emit('result', type=prefix, manifest=manifest_path, html=report_path)
+        return
+
+    # Open in browser
     webbrowser.open(file_url)
     print(f"\n📊 {label}: {file_url}")
     print("   (opened in browser)")
@@ -409,7 +484,17 @@ def run_storage_scan(args):
         scan_data dict, or None if the scan could not be started/completed.
     """
     timer = get_timer()
-    volume_path = select_volume(args.volume, include_all=getattr(args, 'all_volumes', False))
+    if events.enabled():
+        # No picker in JSON mode: nobody is there to choose. The startup
+        # disk is the default, and a path that is not there is an error
+        # rather than a second question.
+        volume_path = args.volume or '/'
+        if not os.path.exists(volume_path):
+            events.emit('error', code='volume_not_found',
+                        text=f"Volume '{volume_path}' is not found or inaccessible.")
+            return None
+    else:
+        volume_path = select_volume(args.volume, include_all=getattr(args, 'all_volumes', False))
     if not volume_path:
         return None
 
@@ -731,10 +816,12 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Commands:
-  (default)  Scan storage (large files and folders)
-  cpu        Scan CPU and RAM usage
-  all        Scan both storage and CPU/RAM
-  export     Export data from existing reports
+  (default)    Scan storage (large files and folders)
+  storage      The same, by name
+  cpu          Scan CPU and RAM usage
+  all          Scan both storage and CPU/RAM
+  permissions  Show which protected folders this run can read
+  export       Export data from existing reports
 
 Examples:
   %(prog)s                              Scan storage
@@ -744,6 +831,7 @@ Examples:
   %(prog)s --all-volumes                Also offer disk images/network shares
   %(prog)s cpu --export-memory mem.csv  Export process data to CSV
   %(prog)s export memory report.json    Export from saved report
+  %(prog)s storage --json --volume /    For programs: JSON events on stdout
         """
     )
 
@@ -753,31 +841,61 @@ Examples:
         version=f'Ask Dad v{VERSION}'
     )
 
-    # Top-level shared flags
-    parser.add_argument('--volume', type=str, help='Volume path to scan (default: prompt)')
-    parser.add_argument('--all-volumes', action='store_true',
-                        help='Include disk images, network shares, and read-only mounts in the volume picker')
-    parser.add_argument('--top', type=int, default=500, help='Number of top files to show (default: 500)')
-    parser.add_argument('--min-size', type=str, help='Minimum file size (e.g., 500MB)')
-    parser.add_argument('--terminal', action='store_true', help='Terminal report only (skip HTML)')
-    parser.add_argument('--no-color', action='store_true', help='Disable ANSI colors in terminal output')
-    parser.add_argument('--test-reports', action='store_true', help='Save reports to test-reports/ folder in project (for development)')
-    parser.add_argument('--skip-protected', action='store_true', help='Skip scanning protected directories (Photos, Messages, Mail)')
-    parser.add_argument('--no-mac-libraries', action='store_true', help='Skip scanning Mac app libraries entirely (faster scan)')
-    parser.add_argument('--library-timeout', type=float, default=60.0,
-                        help='Time budget in seconds for the Mac app library scan (default: 60). '
-                             'Libraries not reached in time are reported as skipped and are not graded.')
-    parser.add_argument('--export-memory', type=str, help='Export all memory processes to CSV file (cpu scan only)')
-    parser.add_argument('--timings', action='store_true',
-                        help='Print how long each phase of the scan took (also on with DIAGNOSTIC_LOGGING=1)')
+    def add_scan_flags(target, top_level):
+        """The scan flags, on the main parser and again on each scan command,
+        so `askdad --json cpu` and `askdad cpu --json` both work. On a
+        command they have no default of their own: an unset flag there must
+        not overwrite the value given before the command."""
+        def flag(*names, **kwargs):
+            if not top_level:
+                kwargs['default'] = argparse.SUPPRESS
+            target.add_argument(*names, **kwargs)
+
+        flag('--volume', type=str, help='Volume path to scan (default: prompt)')
+        flag('--all-volumes', action='store_true',
+             help='Include disk images, network shares, and read-only mounts in the volume picker')
+        flag('--top', type=int, default=500, help='Number of top files to show (default: 500)')
+        flag('--min-size', type=str, help='Minimum file size (e.g., 500MB)')
+        flag('--terminal', action='store_true', help='Terminal report only (skip HTML)')
+        flag('--no-color', action='store_true', help='Disable ANSI colors in terminal output')
+        flag('--test-reports', action='store_true', help='Save reports to test-reports/ folder in project (for development)')
+        flag('--skip-protected', action='store_true', help='Skip scanning protected directories (Photos, Messages, Mail)')
+        flag('--no-mac-libraries', action='store_true', help='Skip scanning Mac app libraries entirely (faster scan)')
+        flag('--library-timeout', type=float, default=60.0,
+             help='Time budget in seconds for the Mac app library scan (default: 60). '
+                  'Libraries not reached in time are reported as skipped and are not graded.')
+        flag('--export-memory', type=str, help='Export all memory processes to CSV file (cpu scan only)')
+        flag('--timings', action='store_true',
+             help='Print how long each phase of the scan took (also on with DIAGNOSTIC_LOGGING=1)')
+        flag('--json', action='store_true',
+             help='For programs: print one JSON event per line on stdout, ask nothing, '
+                  'open nothing. See docs/CONTRACT.md')
+
+    add_scan_flags(parser, top_level=True)
 
     subparsers = parser.add_subparsers(dest='command')
 
+    # storage subcommand: the default, also available by name
+    add_scan_flags(subparsers.add_parser('storage', help='Scan storage (the default)'),
+                   top_level=False)
+
     # cpu subcommand
-    subparsers.add_parser('cpu', help='Scan CPU and RAM usage')
+    add_scan_flags(subparsers.add_parser('cpu', help='Scan CPU and RAM usage'),
+                   top_level=False)
 
     # all subcommand
-    subparsers.add_parser('all', help='Scan both storage and CPU/RAM')
+    add_scan_flags(subparsers.add_parser('all', help='Scan both storage and CPU/RAM'),
+                   top_level=False)
+
+    # permissions subcommand
+    permissions_parser = subparsers.add_parser(
+        'permissions', help='Show which protected folders this run can read')
+    permissions_parser.add_argument('--json', action='store_true', default=argparse.SUPPRESS,
+                                    help='Print the result as one JSON event')
+
+    # share subcommand
+    subparsers.add_parser(
+        'share', help='Get your newest scan file ready to send to the Ask Dad team')
 
     # export subcommand
     export_parser = subparsers.add_parser('export', help='Export data from existing reports')
@@ -793,6 +911,25 @@ Examples:
     # Default to storage scan when no command given
     scan_type = args.command if args.command else 'storage'
 
+    json_mode = getattr(args, 'json', False)
+    if json_mode:
+        if scan_type in ('export', 'share'):
+            parser.error(f'--json does not apply to {scan_type}')
+        if getattr(args, 'terminal', False):
+            # --terminal skips the manifest, and the manifest is the result.
+            parser.error('--json cannot be combined with --terminal')
+        events.enable()
+        events.emit('start', command=scan_type, askdad_version=VERSION,
+                    schema_version=events.SCHEMA_VERSION)
+
+    if scan_type == 'permissions':
+        return run_permissions_check(json_mode)
+
+    if scan_type == 'share':
+        # The same folder the scan saved to: test-reports in a checkout,
+        # ~/.dadware/reports everywhere else.
+        return run_share(get_reports_dir(use_test_reports=is_development_mode()))
+
     if scan_type == 'export':
         # Handle export command separately
         pass
@@ -805,15 +942,14 @@ Examples:
         say("First I'll pick the drive...")
         scan_data = run_storage_scan(args)
         if not scan_data:
+            report_scan_failure('The storage scan did not finish.')
             return 1
 
         with timer.phase('grading'):
             personality_data = add_personality(scan_data)
 
         finish_run(scan_data)
-        use_color = not args.no_color
-        terminal_output = render_terminal(scan_data, personality_data, use_color)
-        print(terminal_output)
+        print_terminal_report(scan_data, personality_data, args)
 
         save_and_open_report(scan_data, personality_data, 'storage', args)
         offer_permission_upgrade(scan_data, args)
@@ -838,15 +974,14 @@ Examples:
 
         if not scan_data:
             print("Error: Could not scan CPU/RAM")
+            report_scan_failure('The memory and CPU scan did not finish.')
             return 1
 
         with timer.phase('grading'):
             personality_data = add_personality(scan_data)
 
         finish_run(scan_data)
-        use_color = not args.no_color
-        terminal_output = render_terminal(scan_data, personality_data, use_color)
-        print(terminal_output)
+        print_terminal_report(scan_data, personality_data, args)
 
         save_and_open_report(scan_data, personality_data, 'cpu', args)
         timer.print_summary()
@@ -860,14 +995,13 @@ Examples:
         scan_data_storage = run_storage_scan(args)
         if not scan_data_storage:
             print("Error: Storage scan failed")
+            report_scan_failure('The storage scan did not finish.')
             return 1
 
         scan_data_cpu = run_cpu_scan(args)
         if not scan_data_cpu:
             print("Warning: CPU scan failed, continuing with storage only")
 
-        # Render terminal output
-        use_color = not args.no_color
         with timer.phase('grading'):
             personality_storage = add_personality(scan_data_storage)
             if scan_data_cpu:
@@ -875,13 +1009,11 @@ Examples:
 
         finish_run(scan_data_storage)
         finish_run(scan_data_cpu)
-        terminal_output = render_terminal(scan_data_storage, personality_storage, use_color)
-        print(terminal_output)
+        print_terminal_report(scan_data_storage, personality_storage, args)
 
         if scan_data_cpu:
             print("\n")
-            terminal_output_cpu = render_terminal(scan_data_cpu, personality_cpu, use_color)
-            print(terminal_output_cpu)
+            print_terminal_report(scan_data_cpu, personality_cpu, args)
 
         # Save and open reports
         save_and_open_report(scan_data_storage, personality_storage, 'storage', args,
@@ -951,6 +1083,15 @@ if __name__ == '__main__':
     try:
         sys.exit(main())
     except KeyboardInterrupt:
+        events.emit('error', code='cancelled', text='Scan cancelled.')
         print("\n\nScan cancelled.")
+        sys.exit(1)
+    except Exception as e:
+        if not events.enabled():
+            raise
+        # A reader of events must get a last line it can parse, not a
+        # traceback on a stream it is not watching.
+        events.emit('error', code='internal_error', text=str(e))
+        traceback.print_exc(file=sys.stderr)
         sys.exit(1)
 

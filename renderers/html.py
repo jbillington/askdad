@@ -16,11 +16,7 @@ from urllib.parse import quote
 from html import escape as escape_html
 from scanners.grading import (
     grade_free_space,
-    grade_home_folders_ratio,
-    grade_home_folders_clutter,
-    grade_library_size,
-    calculate_composite_storage_grade,
-    score_to_letter,
+    grade_storage_report,
 )
 from utils.formatters import format_size, get_status_emoji, get_status_text
 from utils.path_utils import folder_label, is_under, left_out_note
@@ -1163,117 +1159,33 @@ def render_report_card(scan_data):
         else:
             trash_stat = trash.get('total_size_human') or '0 B'
         
-        # Calculate grades
-        free_space_grade = grade_free_space(free_percent)
-        home_folders_total = scan_data.get('home_folders_total_bytes', 0)
-        home_folders_ratio_grade = grade_home_folders_ratio(home_folders_total, used_bytes)
-        
-        # Grade home folders clutter separately (Downloads, Desktop, etc.)
-        top_folders = scan_data.get('top_folders', [])
-        home_folders_clutter_grade = grade_home_folders_clutter(top_folders)
-        
-        # Grade Mac libraries
+        # The grades come from the scanner side, so the report, the manifest
+        # and any other reader of the scan agree on every letter.
+        report = grade_storage_report(scan_data)
+        components = report['components']
+        free_space_grade = components['free_space']
+        home_folders_ratio_grade = components['home_folders_ratio']
+        clutter_scored = report['clutter_scored']
+        libraries_scored = report['libraries_scored']
+        avg_library_grade = components.get('mac_libraries')
+        blocked_and_empty = report['libraries_not_scored_reason'] == 'needs_full_disk_access'
+        composite_grade = report['overall']
+        overall_comment = composite_grade['comment']
+
         mac_libraries = scan_data.get('mac_libraries', {})
-        library_grades = {}
-        library_scores = []
-        
-        library_types = {
-            'photos': 'Photos',
-            'music': 'Music',
-            'messages': 'Messages',
-            'mail': 'Mail',
-            'creative': 'Creative Apps'
-        }
-        
-        # Check overall scan status
         scan_status = mac_libraries.get('scan_status', 'complete')
-        
-        for lib_type, lib_name in library_types.items():
-            lib_data = mac_libraries.get(lib_type, {})
-            lib_status = lib_data.get('status', 'complete')
-            
-            if lib_type in ['photos', 'music', 'creative']:
-                lib_size = lib_data.get('total_size_bytes', 0)
-            else:
-                lib_size = lib_data.get('size_bytes', 0)
-            
-            # Show library if it has size, if it was skipped/interrupted, or if
-            # it came back empty only because we lack permission to read it -
-            # an invisible zero would make the grade look complete.
-            # Only when a library scan actually ran. With --no-mac-libraries
-            # there is nothing to be blocked from, and "needs Full Disk Access"
-            # would be the wrong explanation for a section the user turned off.
-            blocked = bool(mac_libraries) and lib_type in (
-                (scan_data.get('permission_status') or {}).get('missing_permissions') or []
-            )
-            if lib_size > 0 or lib_status != 'complete' or blocked:
-                if lib_type == 'messages' and lib_size > 0:
-                    # Messages is the user's own history: a big one is not a
-                    # problem to fix, and an F for it reads as scolding. Show
-                    # the size, leave it out of the grade.
-                    grade = {'letter': '-', 'score': 0}
-                elif lib_size > 0:
-                    grade = grade_library_size(lib_size, lib_type, used_bytes)
-                else:
-                    # No grade for skipped/interrupted libraries
-                    grade = {'letter': '-', 'score': 0}
-                
-                library_grades[lib_type] = {
-                    'name': lib_name,
-                    'grade': grade,
-                    'size': (format_size(lib_size) + (' (not graded)' if lib_type == 'messages' else ''))
-                            if lib_size > 0 else 'N/A',
-                    'status': lib_status,
-                    'reason': lib_data.get('reason', '')
-                }
-                if lib_size > 0 and lib_type != 'messages':
-                    library_scores.append(grade['score'])
-        
-        # Calculate average library grade (only from completed scans with size > 0)
-        avg_library_score = sum(library_scores) / len(library_scores) if library_scores else 0
-        avg_library_grade = {
-            'letter': score_to_letter(avg_library_score) if library_scores else '-',
-            'score': avg_library_score
+        library_grades = {
+            lib_type: {
+                'name': lib['name'],
+                'grade': {'letter': lib['letter'], 'score': lib['score']},
+                'size': (lib['size_human'] + (' (not graded)' if lib_type == 'messages' else ''))
+                        if lib['size_bytes'] > 0 else 'N/A',
+                # 'no-permission' is this page's name for a refused library.
+                'status': 'no-permission' if lib['status'] == 'denied' else lib['status'],
+                'reason': lib['reason'],
+            }
+            for lib_type, lib in report['libraries'].items()
         }
-        
-        # A library that never ran is left out of the average above rather than
-        # averaged in as a zero, so a truncated scan does not drag the score
-        # down - it quietly shrinks the evidence behind it. Scoring that subset
-        # as though every library had been measured would overstate it, so an
-        # incomplete library scan drops the component and lets the weights
-        # renormalize: the composite reflects only what the scan actually saw.
-        libraries_incomplete = any(
-            info.get('status') not in ('complete', None)
-            for info in library_grades.values()
-        )
-
-        # A library blocked by Full Disk Access does NOT report an error - it
-        # reports status 'complete' with zero bytes, because the scanner simply
-        # finds nothing at a path it cannot read. So the status check above
-        # sails straight past it, and the average would be computed from
-        # whatever is left. Without FDA, Photos, Messages and Mail can all
-        # silently drop out, leaving one library's grade presented as though
-        # it covered them all.
-        missing_permissions = set(
-            (scan_data.get('permission_status') or {}).get('missing_permissions') or []
-        )
-        # Only libraries that came back *silently* empty. One that already
-        # reported 'error' or 'skipped' is telling the truth about itself and
-        # keeps its own status - the case handled here is the library that
-        # claims success while having measured nothing.
-        blocked_and_empty = {
-            lib_type for lib_type, info in library_grades.items()
-            if lib_type in missing_permissions
-            and info.get('size') == 'N/A'
-            and info.get('status') == 'complete'
-        }
-        if blocked_and_empty:
-            libraries_incomplete = True
-            for lib_type in blocked_and_empty:
-                library_grades[lib_type]['status'] = 'no-permission'
-                library_grades[lib_type]['reason'] = 'needs Full Disk Access'
-
-        libraries_scored = bool(library_scores) and not libraries_incomplete
         
         # Each line says what it looks at and what share of the grade it
         # carries. A bare "Home Folders Ratio: A" leaves the reader no idea
@@ -1310,38 +1222,24 @@ def render_report_card(scan_data):
             library_row_note = (
                 f'<div class="grade-note">{component_notes["mac_libraries"]} {reason}</div>')
         
-        # Home folders clutter counts toward the composite, so an F on
-        # Downloads and Desktop moves the big letter at the top. It is the one
-        # component measuring something a reader can act on in ten minutes,
-        # which is the whole promise of the report.
-        component_grades = {
-            'free_space': free_space_grade,
-            'home_folders_ratio': home_folders_ratio_grade,
-            'home_folders_clutter': home_folders_clutter_grade,
-        }
-        weights = {
-            'free_space': 0.5,
-            'home_folders_ratio': 0.15,
-            'home_folders_clutter': 0.2,
-        }
-        if libraries_scored:
-            component_grades['mac_libraries'] = avg_library_grade
-            weights['mac_libraries'] = 0.15
-        # Renormalize to 1.0. Without this, dropping a component silently
-        # subtracts its weight from the top-line score instead of
-        # redistributing it, so --no-mac-libraries, a flag that only means
-        # "don't look here", would cost points.
-        total_weight = sum(weights.values())
-        weights = {k: v / total_weight for k, v in weights.items()}
-        composite_grade = calculate_composite_storage_grade(component_grades, weights)
         
-        # Get overall grade comment
-        overall_comment = "Excellent!" if composite_grade['score'] >= 90 else \
-                          "Good job!" if composite_grade['score'] >= 80 else \
-                          "Room for improvement" if composite_grade['score'] >= 70 else \
-                          "Needs work" if composite_grade['score'] >= 60 else \
-                          "Critical issues"
-        
+        # A blocked Downloads or Desktop looks empty, and empty is an A. The
+        # row says what was blocked instead of showing a letter it did not earn.
+        if clutter_scored:
+            clutter_grade = components['home_folders_clutter']
+            clutter_title = "Clutter (20% of grade)"
+            clutter_letter = clutter_grade['letter']
+            clutter_score = f"{clutter_grade['score']:.0f}/100"
+            clutter_note = component_notes['home_folders_clutter']
+        else:
+            blocked = ' and '.join(report['clutter_blocked_folders'])
+            clutter_title = "Clutter (not counted in grade)"
+            clutter_letter = '-'
+            clutter_score = 'not scored'
+            clutter_note = escape_html(
+                f"{component_notes['home_folders_clutter']} macOS did not let Ask Dad "
+                f"open {blocked}, so this is not counted toward the overall grade.")
+
         # How full the disk actually is: the figure behind the Free Space
         # grade, and the one a storage tool most owes the reader.
         total_human = volume_info.get('total_human', '0 B')
@@ -1397,10 +1295,10 @@ def render_report_card(scan_data):
                 </div>
                 
                 <div class="grade-row">
-                    <div class="grade-label">Clutter (20% of grade)<div class="grade-note">{component_notes['home_folders_clutter']}</div></div>
+                    <div class="grade-label">{clutter_title}<div class="grade-note">{clutter_note}</div></div>
                     <div class="grade-display">
-                        <div class="grade-letter grade-letter-{home_folders_clutter_grade['letter']}">{home_folders_clutter_grade['letter']}</div>
-                        <div class="grade-score">{home_folders_clutter_grade['score']:.0f}/100</div>
+                        <div class="grade-letter grade-letter-{clutter_letter}">{clutter_letter}</div>
+                        <div class="grade-score">{clutter_score}</div>
                     </div>
                 </div>
                 
@@ -1434,6 +1332,8 @@ def render_report_card(scan_data):
                     status_badge = '<span style="display: inline-block; font-size: 0.8em; margin-left: 8px; padding: 1px 8px; border-radius: 4px; background: #faecc8; color: #7a4900;">(interrupted)</span>'
                 elif lib_status == 'no-permission':
                     status_badge = '<span style="display: inline-block; font-size: 0.8em; margin-left: 8px; padding: 1px 8px; border-radius: 4px; background: #faecc8; color: #7a4900;">(needs Full Disk Access)</span>'
+                elif lib_status == 'partial':
+                    status_badge = '<span style="display: inline-block; font-size: 0.8em; margin-left: 8px; padding: 1px 8px; border-radius: 4px; background: #faecc8; color: #7a4900;">(at least - not all of it could be measured)</span>'
                 
                 # A grade without an action is a scolding: a D or F gets one
                 # line on what the owner can do about it, in the same

@@ -89,6 +89,10 @@ are the quickest to clear. Each folder adds problem points:
 | 3 | 62 | D | one over 10 GB and the other over 5 GB |
 | 4 | 40 | F | both over 10 GB |
 
+If macOS does not let Ask Dad open Downloads or Desktop, Ask Dad cannot see what is in
+them. Then the clutter row shows "not scored", and it does not count toward the overall
+grade.
+
 ### What is the home folder share?
 
 It is how much of the used space on the disk is in your home folder (the folder with your
@@ -210,6 +214,44 @@ Some files are measured by the space they really take on the disk, not the size 
 Virtual machine disks and Docker images can claim 64 GB while using only 9 GB; Ask Dad
 reports the 9 GB.
 
+### How does Ask Dad handle iCloud, OneDrive, Google Drive and Dropbox?
+
+Ask Dad counts only what is on your Mac. A cloud file can be in one of two states:
+
+- **Downloaded.** The file is on your Mac and uses disk space. Ask Dad counts its full size,
+  and it can show in "Top 25 Files".
+- **Cloud only.** Finder shows a cloud icon beside the file. The contents are on the
+  internet, not on your Mac. Ask Dad counts only the few bytes it uses on your Mac, so it is
+  never shown as a big file.
+
+Where Ask Dad finds each service:
+
+| Service | Folder on your Mac | What Ask Dad does |
+|---|---|---|
+| iCloud Drive | `~/Library/Mobile Documents` (Finder shows it as iCloud Drive) | Scans it. Counts downloaded files only. |
+| Desktop and Documents in iCloud | `~/Desktop` and `~/Documents` | Scans them as usual. Counts downloaded files only. |
+| OneDrive, Google Drive, Dropbox, Box | `~/Library/CloudStorage/<service>-<account>` | Scans it. Counts downloaded files only. |
+| Older Dropbox, OneDrive and Google Drive apps | `~/Dropbox`, `~/OneDrive`, `~/Google Drive` | Scans it. Counts the space each file uses on your Mac. |
+| Old Google Drive (Drive File Stream) | A drive under `/Volumes` | Skips it, as it skips every other drive. |
+
+Each cloud folder is part of `~/Library`, so its total shows in the Library row. Its big
+downloaded files show in "Top 25 Files" with their full path.
+
+Ask Dad never downloads a file, and it makes no network calls. To list a cloud folder,
+macOS asks the cloud app (OneDrive, Google Drive and so on), and that app can check with its
+own server.
+
+### What if a cloud drive does not answer?
+
+When a cloud account is signed out, or its app is not running, macOS can wait a long time
+for a folder list and then stop with "Operation timed out". Ask Dad then skips the rest of
+that cloud drive and tells you which folder it could not read. The other drives and folders
+are still in the report. The saved `.json` file lists the folders in `unreadable_paths`.
+
+To include that drive next time, open its app, sign in and let it finish syncing. If you do
+not use the account, or you cannot sign in because it was a school or work account you no
+longer have, remove the account in the app's settings.
+
 ### What about a scan of an external drive?
 
 A drive that isn't your Mac's startup disk gets a shorter report with no letter grade: free
@@ -309,6 +351,17 @@ itself.
 
 ### What is the .json file next to the report?
 
-It is the full scan data, saved so a report can be redrawn later. For the memory scan it
-holds every process's full command line, which can include your user name and folder paths.
-Keep it to yourself; share the HTML report or the AI prompt instead.
+It is the full scan data, saved so a report can be redrawn later. A storage scan lists the
+names and sizes of your folders and files, not what is inside them. The memory scan holds
+every process's full command line, which can include your user name and folder paths.
+Share it only with someone you trust.
+
+### How do I send my scan to the Ask Dad team?
+
+When a scan is done, type `askdad share` in the same Terminal window and press Return. Dad
+finds your newest storage scan, tells you what is in it, and asks before he does anything.
+If you say yes, he copies the file and opens a Finder window with it selected. Open a new
+email or a Messages chat and press Cmd+V to attach it. If nothing attaches, drag the file
+from the Finder window into your message.
+
+Nothing is sent until you send the message yourself. Ask Dad makes no network calls.

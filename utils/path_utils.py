@@ -1,6 +1,7 @@
 """Shared path filtering and folder size utilities."""
 
 import os
+import re
 import subprocess
 import stat as stat_module
 
@@ -379,10 +380,72 @@ def is_under(path, parent):
     return path == parent or path.startswith(parent.rstrip(os.sep) + os.sep)
 
 
+# `st_flags` bit macOS sets on a file whose contents are in the cloud only:
+# iCloud Drive with Optimize Mac Storage, and OneDrive, Google Drive and
+# Dropbox "online-only" files under ~/Library/CloudStorage. `st_size` is the
+# full size of the file in the cloud; `st_blocks` is what it uses on this
+# Mac. Not in the `stat` module before Python 3.13.
+SF_DATALESS = 0x40000000
+
+
+def is_cloud_only(stat_result):
+    """Is this file a cloud placeholder, with no contents on this Mac?
+
+    Reading the flag from a stat result costs nothing and does not download
+    the file.
+    """
+    return bool(getattr(stat_result, 'st_flags', 0) & SF_DATALESS)
+
+
+# Cloud folders the older apps keep directly in the home folder, outside
+# ~/Library/CloudStorage: the classic Dropbox app (`~/Dropbox`,
+# `~/Dropbox (Team)`), the older OneDrive app (`~/OneDrive`,
+# `~/OneDrive - Contoso`), Google Backup and Sync (`~/Google Drive`) and Box.
+# These apps do not always set SF_DATALESS on an online-only file, so the
+# test for them is the space the file takes on disk.
+_HOME_CLOUD_FOLDER = re.compile(
+    r'^/Users/[^/]+/(Dropbox( \([^/]*\))?|OneDrive( - [^/]*)?|Google Drive|Box|Box Sync)/')
+_LIBRARY_CLOUD_MARKERS = ('/Library/Mobile Documents/', '/Library/CloudStorage/')
+
+
+def is_cloud_path(path):
+    """Is this path inside a cloud drive folder: iCloud Drive, a File
+    Provider drive in ~/Library/CloudStorage, or an older app's folder in
+    the home folder?"""
+    return (any(marker in path for marker in _LIBRARY_CLOUD_MARKERS)
+            or _HOME_CLOUD_FOLDER.match(path) is not None)
+
+
+# Where macOS mounts the File Provider cloud drives (OneDrive, Google Drive,
+# Dropbox, Box, ...): one folder per signed-in account.
+CLOUD_STORAGE_DIR = os.path.join('Library', 'CloudStorage')
+
+
+def cloud_storage_root(path):
+    """The cloud drive folder `path` is in, such as
+    `~/Library/CloudStorage/OneDrive-Contoso`, or None when it is in none.
+
+    The File Provider app answers every folder listing in that drive. When
+    the app is not running or the account is signed out, each listing can
+    wait a long time and then fail, so the walk uses this to give up on the
+    whole drive after one failure.
+    """
+    marker = os.sep + CLOUD_STORAGE_DIR + os.sep
+    index = path.find(marker)
+    if index < 0:
+        return None
+    start = index + len(marker)
+    name = path[start:].split(os.sep, 1)[0]
+    if not name:
+        return None
+    return path[:start] + name
+
+
 def get_file_size(path, stat_result=None):
     """
-    Get file size with smart handling for Docker/sparse files.
-    Returns actual disk usage for Docker/sparse files, logical size otherwise.
+    Get file size with smart handling for cloud-only, Docker and sparse files.
+    Returns actual disk usage for those, logical size otherwise. A cloud-only
+    file uses almost nothing on this Mac, so it does not count as a big file.
 
     If `stat_result` is provided, it is reused instead of re-statting the
     path. Otherwise a single os.stat() call is made and passed down to
@@ -391,6 +454,14 @@ def get_file_size(path, stat_result=None):
     if stat_result is None:
         stat_result = os.stat(path)
 
+    on_disk = stat_result.st_blocks * 512
+    if is_cloud_only(stat_result):
+        return on_disk
+    # An online-only file in a cloud folder whose app does not set the
+    # dataless flag: it lists its full size but takes almost no disk. The
+    # size test comes first, because it costs nothing and most files fail it.
+    if on_disk < stat_result.st_size and is_cloud_path(path):
+        return on_disk
     if is_docker_path(path) or is_sparse_file(path, stat_result=stat_result):
         return stat_result.st_blocks * 512
     else:

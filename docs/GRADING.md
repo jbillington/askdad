@@ -7,7 +7,7 @@ range, not by reading their comments.
 Two independent systems read the same scan and both end up on the report:
 
 - **The grade** — the big letter and `X/100`, plus the per-component breakdown.
-  Built in `scanners/grading.py`, assembled in `renderers/html.py`.
+  Built in `scanners/grading.py` (`grade_storage_report()`), drawn by `renderers/html.py`.
 - **"Dad says"** — the comment lines, the tips, and the ok/warn/critical colour.
   Built in `personality/dad.py`, from the raw scan data.
 
@@ -133,6 +133,14 @@ needs both folders to have two tiers. Give Desktop only one tier and the maximum
 becomes 3, and F becomes impossible no matter how the scores are spaced.
 `TestEveryClutterLetterIsReachable` pins both halves, because changing either
 one alone silently reopens the hole.
+
+**When macOS blocks a folder.** A Downloads or Desktop the scan could not open
+looks empty, and an empty folder scores 100. So when `permission_status.folders`
+marks either one `denied`, the clutter component is **not scored**: it is
+dropped from the composite and the other weights renormalize, the same rule as
+the libraries below. The report card shows `-`, "not scored", and names the
+blocked folders. The manifest says `clutter_scored: false` and lists them in
+`clutter_blocked_folders`.
 
 ---
 
@@ -266,8 +274,8 @@ component is dropped instead.
 
 ## 6. The composite
 
-Assembled in `render_report_card()` (`renderers/html.py`), not in
-`scanners/grading.py`.
+Assembled in `grade_storage_report()` (`scanners/grading.py`). `render_report_card()`
+(`renderers/html.py`) draws the result, and the JSON manifest stores it as `grades`.
 
 ```
 composite = 0.5  * free_space

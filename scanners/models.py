@@ -176,6 +176,16 @@ class StorageScan:
     # manifest readers that expect a single total.
     excluded_count: int = 0
     denied_count: int = 0
+    # The refused paths by name, each `{'path', 'reason'}` with reason 'tcc'
+    # (macOS privacy) or 'posix' (file permissions). Capped by the scanner,
+    # so it can be shorter than `denied_count`.
+    denied_paths: List[Dict[str, str]] = field(default_factory=list)
+    # Folders the filesystem would not list for a reason other than
+    # permission: a cloud drive that did not answer (ETIMEDOUT), an I/O
+    # error, a folder that vanished. Each `{'path', 'error'}`, capped by the
+    # scanner like `denied_paths`. Everything inside them is missing from
+    # the numbers.
+    unreadable_paths: List[Dict[str, str]] = field(default_factory=list)
     duration_seconds: float = 0.0
 
     @property
@@ -194,6 +204,8 @@ class StorageScan:
             'skipped_count': self.skipped_count,
             'excluded_count': self.excluded_count,
             'denied_count': self.denied_count,
+            'denied_paths': [dict(p) for p in self.denied_paths],
+            'unreadable_paths': [dict(p) for p in self.unreadable_paths],
             'duration_seconds': self.duration_seconds,
         }
 
@@ -212,6 +224,8 @@ class StorageScan:
             # permission trouble the user never had.
             excluded_count=d.get('excluded_count', d.get('skipped_count', 0)),
             denied_count=d.get('denied_count', 0),
+            denied_paths=[dict(p) for p in d.get('denied_paths', [])],
+            unreadable_paths=[dict(p) for p in d.get('unreadable_paths', [])],
             duration_seconds=d.get('duration_seconds', 0.0),
         )
 

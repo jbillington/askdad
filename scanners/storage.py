@@ -1,5 +1,6 @@
 """Storage scanner - finds large files and folders."""
 
+import errno
 import heapq
 import itertools
 import os
@@ -10,7 +11,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 from utils.path_utils import (
     is_docker_path, is_sparse_file, should_exclude, get_file_size,
     is_app_bundle, app_bundle_sizes,
-    get_scan_device_ids,
+    get_scan_device_ids, cloud_storage_root,
 )
 from utils.volumes import get_volume_info
 
@@ -65,10 +66,6 @@ def _folder_key_for(path: str, parts: List[str]) -> Tuple[str, str]:
         return parts[0], os.path.join(path, parts[0])
 
 
-# How deep below a folder's immediate subfolder the walk still counts bytes
-# toward that subfolder's total.
-_SUBFOLDER_MAX_DEPTH = 10
-
 # Bound on how many of a folder's direct-child files are retained (per
 # folder_key) while scanning.
 _MAX_FOLDER_TOP_FILES = 100
@@ -93,6 +90,19 @@ def _home_prefix_parts(root: str, home_path: Optional[str]) -> Optional[List[str
     return rel.split(os.sep)
 
 
+def _display_name(folder_key: str) -> str:
+    """How a folder row is labelled.
+
+    A name with a backslash in it reads as a Windows path: some apps ported
+    from Windows make folders such as `Library\\CherryAudio\\DCO-106` in the
+    home folder, and a reader takes that row for `~/Library/CherryAudio` and
+    for a mistake in the report. Say that it is one folder.
+    """
+    if '\\' in folder_key:
+        return f"{folder_key} (one folder, not a path)"
+    return folder_key
+
+
 class _FolderBuckets:
     """The depth<=2 folder breakdown for one root, accumulated during the walk.
 
@@ -108,8 +118,8 @@ class _FolderBuckets:
       - the bucket's total size (files at or above the scan's min_size_bytes)
       - a bounded (<=100) min-heap of that folder's own *direct* child files
       - the set of that folder's immediate child directory names
-      - each such child directory's recursive size (capped at
-        _SUBFOLDER_MAX_DEPTH levels below the child)
+      - each such child directory's recursive size, at every depth, so a
+        subfolder's total agrees with the folder row of the same name
     These ignore min_size_bytes entirely, which is why add_file() tracks the
     per-folder structures unconditionally, before count_file() applies the
     filter.
@@ -135,15 +145,18 @@ class _FolderBuckets:
 
         Precomputes (once per directory, not per file) which of the up-to-3
         ancestor buckets (scan-root/Home, depth-1, depth-2) this directory
-        rolls up into as a *subfolder*, and under what child name, up to
-        _SUBFOLDER_MAX_DEPTH levels below that child.
+        rolls up into as a *subfolder*, and under what child name. There is
+        no depth limit: at most three ancestors are updated per directory
+        however deep it is, and a limit made `~/Library` (often more than
+        ten levels deep) look 1.7 GB smaller as a subfolder of Home than as
+        its own row.
         """
         self.entered = True
         own_key, own_actual = _folder_key_for(self.root, parts)
         depth_here = len(parts)
         subfolder_targets = []  # [(ancestor_key, child_name), ...]
         for d in (0, 1, 2):
-            if depth_here > d and (depth_here - d - 1) <= _SUBFOLDER_MAX_DEPTH:
+            if depth_here > d:
                 ancestor_key, _ = _folder_key_for(self.root, parts[:d])
                 subfolder_targets.append((ancestor_key, parts[d]))
             # Register this directory itself as a known immediate child (even
@@ -225,17 +238,24 @@ class _FolderBuckets:
                 folder_key, os.path.join(self.root, folder_key))
             folder_list.append((folder_key, FolderInfo(
                 path=folder_path,       # Use actual path if available
-                display=folder_key,     # Keep relative path for display
+                display=_display_name(folder_key),
                 size_bytes=size,
                 # Mark Docker folders
                 is_docker=is_docker_path(folder_path),
             )))
         folder_list.sort(key=lambda kv: (-kv[1].size_bytes, kv[1].path))
 
+        root_key = _folder_key_for(self.root, [])[0]
         for folder_key, folder in folder_list[:limit]:
             heap = self.top_files_heap.get(folder_key, [])
             folder.top_files = sorted((item[2] for item in heap),
                                       key=lambda f: (-f.size_bytes, f.path))
+            if rollup and folder_key == root_key:
+                # Rolled up, the root's row holds only the files loose in
+                # it. Every folder inside it already has a row of its own,
+                # so listing them again here only repeats the chart.
+                folder.subfolders = []
+                continue
             names = self.subfolder_names.get(folder_key, ())
             sizes = self.subfolder_sizes.get(folder_key, {})
             subfolders = [
@@ -259,6 +279,42 @@ def _entry_device(entry):
         return entry.stat(follow_symlinks=False).st_dev
     except OSError:
         return None
+
+
+# How many refused paths a scan lists by name. A Mac without Full Disk Access
+# refuses a few dozen folders; the cap is there so one odd disk cannot fill
+# the manifest.
+DENIED_PATHS_CAP = 200
+
+
+def denial_reason(error: OSError) -> str:
+    """Why a path was refused: 'tcc' or 'posix'.
+
+    EPERM is macOS privacy protection (TCC), which Full Disk Access or a
+    folder permission lifts. Anything else is ordinary file permissions -
+    another user's home, a root-only folder - which no privacy setting
+    changes. A report that offers Full Disk Access must not count the second
+    kind among the things it would fix.
+    """
+    return 'tcc' if error.errno == errno.EPERM else 'posix'
+
+
+def _entries_until_error(entries, on_error):
+    """Yield from a `scandir` iterator until it ends or fails.
+
+    A failure part way through a listing (ETIMEDOUT from a cloud drive, an
+    I/O error) goes to `on_error(error)` and ends the listing. The entries
+    already yielded stay counted.
+    """
+    while True:
+        try:
+            entry = next(entries)
+        except StopIteration:
+            return
+        except OSError as error:
+            on_error(error)
+            return
+        yield entry
 
 
 def scan_storage(path: str, depth: int = 2, top_n: int = 500, min_size_bytes: int = 0,
@@ -313,6 +369,49 @@ def scan_storage(path: str, depth: int = 2, top_n: int = 500, min_size_bytes: in
     # with full access that they have a permission problem.
     excluded_count = 0
     denied_count = 0
+    # Which paths were refused, and why, for the first DENIED_PATHS_CAP of
+    # them. The count above stays exact when the list is cut short.
+    denied_paths: List[Dict[str, str]] = []
+
+    def note_denied(denied_path: str, error: OSError) -> None:
+        if len(denied_paths) < DENIED_PATHS_CAP:
+            denied_paths.append({'path': denied_path,
+                                 'reason': denial_reason(error)})
+
+    # Folders that could not be listed for any other reason, and the cloud
+    # drives given up on. One folder that fails must not end the scan: a
+    # signed-out OneDrive answers a listing with ETIMEDOUT, and before this
+    # that one error threw away the whole report.
+    unreadable_paths: List[Dict[str, str]] = []
+    dead_cloud_roots = set()
+
+    def note_unreadable(folder: str, error: OSError) -> None:
+        if error.errno == errno.ENOENT:
+            return  # Deleted while the scan ran: nothing is missing.
+        reason = error.strerror or str(error)
+        if len(unreadable_paths) < DENIED_PATHS_CAP:
+            unreadable_paths.append({'path': folder, 'error': reason})
+        if progress_callback:
+            print()  # End the "found N items" line it overwrites with \r.
+        print(f"→ couldn't read {folder} ({reason}). Skipping it.")
+        # Every folder in a cloud drive is listed by the same app. When it
+        # has stopped answering, each further folder would wait just as long
+        # and fail just the same, so give up on the whole drive.
+        if error.errno == errno.ETIMEDOUT:
+            cloud_root = cloud_storage_root(folder)
+            if cloud_root is not None and cloud_root not in dead_cloud_roots:
+                dead_cloud_roots.add(cloud_root)
+                print(f"→ {os.path.basename(cloud_root)} isn't answering. "
+                      "Skipping the rest of that cloud drive.")
+
+    def listing_failed(folder: str, error: OSError) -> None:
+        """A folder listing that failed part way through."""
+        nonlocal denied_count
+        if isinstance(error, PermissionError):
+            denied_count += 1
+            note_denied(folder, error)
+        else:
+            note_unreadable(folder, error)
 
     # Track largest files
     largest_files: List[FileInfo] = []
@@ -413,6 +512,8 @@ def scan_storage(path: str, depth: int = 2, top_n: int = 500, min_size_bytes: in
                 last_progress_time = current_time  # Reset progress time too
 
             root, parts = stack.pop()
+            if dead_cloud_roots and cloud_storage_root(root) in dead_cloud_roots:
+                continue
             ctx = buckets.enter_dir(parts)
             # The same directory, bucketed a second time relative to home.
             home_ctx = None
@@ -421,21 +522,29 @@ def scan_storage(path: str, depth: int = 2, top_n: int = 500, min_size_bytes: in
 
             try:
                 entries = os.scandir(root)
-            except PermissionError:
+            except PermissionError as error:
                 # A folder we were refused outright. Everything inside it is
                 # invisible to the scan, so this is exactly the case the
                 # report should be honest about rather than pass over in
                 # silence, as os.walk()'s default onerror=None would.
                 denied_count += 1
+                note_denied(root, error)
                 continue
-            except OSError:
-                # Not permission: vanished mid-scan, bad mount, I/O error.
+            except OSError as error:
+                # Not permission: vanished mid-scan, bad mount, I/O error,
+                # a cloud drive that did not answer.
+                note_unreadable(root, error)
                 continue
 
             bundles = []
 
+            # Listing a folder can fail part way through, not only at the
+            # start: a cloud drive's app answers each batch of entries, and
+            # can time out on any of them. Keep what was read, note the
+            # folder, and go on to the next one.
             with entries:
-                for entry in entries:
+                for entry in _entries_until_error(
+                        entries, lambda error, folder=root: listing_failed(folder, error)):
                     entry_path = entry.path
 
                     try:
@@ -508,8 +617,9 @@ def scan_storage(path: str, depth: int = 2, top_n: int = 500, min_size_bytes: in
                     try:
                         st = entry.stat()
                         file_size = get_file_size(entry_path, stat_result=st)
-                    except PermissionError:
+                    except PermissionError as error:
                         denied_count += 1
+                        note_denied(entry_path, error)
                         continue
                     except OSError:
                         # Not a permission problem - a broken symlink target,
@@ -580,6 +690,8 @@ def scan_storage(path: str, depth: int = 2, top_n: int = 500, min_size_bytes: in
             home_folders_total_bytes=home_folders_total_bytes,
             excluded_count=excluded_count,
             denied_count=denied_count,
+            denied_paths=denied_paths,
+            unreadable_paths=unreadable_paths,
             duration_seconds=duration,
         )
 
